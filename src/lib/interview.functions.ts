@@ -1,12 +1,13 @@
 import { createServerFn } from "@tanstack/react-start";
 import { z } from "zod";
 
-import { requireSupabaseAuth } from "@/integrations/supabase/auth-middleware";
+import { requireFirebaseAuth } from "@/integrations/firebase/auth-middleware";
+import { createInterview, getInterviewDocument, updateInterview } from "@/integrations/firebase/firestore.server";
 import { evaluateInterviewAnswers, generateInterviewQuestions } from "@/lib/interview.server";
 
 /** Generates questions with AI and stores a new in-progress interview. */
 export const generateInterview = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
+  .middleware([requireFirebaseAuth])
   .inputValidator((input: unknown) =>
     z
       .object({
@@ -25,9 +26,8 @@ export const generateInterview = createServerFn({ method: "POST" })
     }
 
 
-    const { data: row, error } = await context.supabase
-      .from("interviews")
-      .insert({
+    const id = await createInterview(context.firebaseToken, {
+        id: crypto.randomUUID(),
         user_id: context.userId,
         role: data.role,
         difficulty: data.difficulty,
@@ -35,33 +35,33 @@ export const generateInterview = createServerFn({ method: "POST" })
         status: "in_progress",
         questions,
         answers: {},
-      })
-      .select("id")
-      .single();
-
-    if (error) throw new Error(error.message);
-    return { id: row.id as string };
+        evaluation: null,
+        overall_score: null,
+        technical_score: null,
+        communication_score: null,
+        problem_solving_score: null,
+        duration_seconds: 0,
+        created_at: new Date().toISOString(),
+        completed_at: null,
+      });
+    return { id };
   });
 
 /** Scores the submitted answers with AI and completes the interview. */
 export const evaluateInterview = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
+  .middleware([requireFirebaseAuth])
   .inputValidator((input: unknown) =>
     z
       .object({
-        interviewId: z.string().uuid(),
+        interviewId: z.string().min(1),
         answers: z.record(z.string(), z.string()),
         durationSeconds: z.number().int().min(0),
       })
       .parse(input),
   )
   .handler(async ({ data, context }) => {
-    const { data: interview, error: loadError } = await context.supabase
-      .from("interviews")
-      .select("*")
-      .eq("id", data.interviewId)
-      .single();
-    if (loadError) throw new Error(loadError.message);
+    const interview = await getInterviewDocument(context.firebaseToken, data.interviewId);
+    if (interview.user_id !== context.userId) throw new Error("Interview not found.");
 
     const questions = (interview.questions ?? []) as {
       id: string;
@@ -83,9 +83,8 @@ export const evaluateInterview = createServerFn({ method: "POST" })
     );
 
 
-    const { error: updateError } = await context.supabase
-      .from("interviews")
-      .update({
+    await updateInterview(context.firebaseToken, data.interviewId, {
+        ...interview,
         status: "completed",
         answers: data.answers,
         evaluation,
@@ -95,9 +94,6 @@ export const evaluateInterview = createServerFn({ method: "POST" })
         problem_solving_score: Math.round(evaluation.problemSolvingScore),
         duration_seconds: data.durationSeconds,
         completed_at: new Date().toISOString(),
-      })
-      .eq("id", data.interviewId);
-
-    if (updateError) throw new Error(updateError.message);
+      });
     return { ok: true };
   });

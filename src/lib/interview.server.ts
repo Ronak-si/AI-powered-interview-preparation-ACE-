@@ -3,10 +3,6 @@ import { z } from "zod";
 
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 
-import { createLovableAiGatewayProvider } from "@/lib/ai-gateway.server";
-
-// Lovable hosting: managed AI gateway. Self-hosted (Vercel): your own Gemini key.
-const LOVABLE_MODEL = "google/gemini-3.6-flash";
 const GEMINI_MODEL = process.env["GEMINI_MODEL"] || "gemini-2.5-flash";
 
 const QuestionsSchema = z.object({
@@ -49,7 +45,7 @@ type Question = { id: string; question: string; topic: string; hint: string };
 
 type Evaluation = z.infer<typeof EvaluationSchema>;
 
-/** Returns a model bound to whichever AI provider this deployment is configured for. */
+/** Returns a model bound to the server-side Gemini API key. */
 function getModel() {
   const geminiKey = process.env["GEMINI_API_KEY"];
   if (geminiKey) {
@@ -61,11 +57,7 @@ function getModel() {
     return google(GEMINI_MODEL);
   }
 
-  const key = process.env["LOVABLE_API_KEY"];
-  if (!key) {
-    throw new Error("AI is not configured. Set GEMINI_API_KEY (or LOVABLE_API_KEY on Lovable).");
-  }
-  return createLovableAiGatewayProvider(key)(LOVABLE_MODEL);
+  throw new Error("AI is not configured. Set GEMINI_API_KEY in the deployment environment.");
 }
 
 function extractJson(text: string | undefined): unknown {
@@ -122,9 +114,6 @@ function normalizeEvaluation(value: unknown): Evaluation | null {
 function friendlyAiError(error: unknown): never {
   const message = error instanceof Error ? error.message : String(error);
   if (message.includes("429")) throw new Error("AI rate limit reached. Please retry in a moment.");
-  if (message.includes("402")) {
-    throw new Error("AI credits exhausted. Add credits in your workspace to continue.");
-  }
   throw new Error(message);
 }
 
