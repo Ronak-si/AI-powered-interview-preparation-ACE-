@@ -1,9 +1,20 @@
-import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
+import { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react";
 import type { ReactNode } from "react";
-import type { Session, User } from "@supabase/supabase-js";
-
-import { supabase } from "@/integrations/supabase/client";
-import { lovable } from "@/integrations/lovable/index";
+import type { User } from "firebase/auth";
+import {
+  GoogleAuthProvider,
+  createUserWithEmailAndPassword,
+  confirmPasswordReset,
+  onAuthStateChanged,
+  sendPasswordResetEmail,
+  signInWithEmailAndPassword,
+  signInWithPopup,
+  signOut as firebaseSignOut,
+  updatePassword as firebaseUpdatePassword,
+  updateProfile as firebaseUpdateAuthProfile,
+} from "firebase/auth";
+import { doc, getDoc, setDoc, updateDoc } from "firebase/firestore";
+import { auth, db } from "@/integrations/firebase/client";
 
 export type Profile = {
   id: string;
@@ -17,7 +28,7 @@ export type Profile = {
 
 type AuthContextValue = {
   user: User | null;
-  session: Session | null;
+  session: { access_token: string } | null;
   profile: Profile | null;
   loading: boolean;
   signIn: (email: string, password: string) => Promise<void>;
@@ -31,170 +42,102 @@ type AuthContextValue = {
 
 const AuthContext = createContext<AuthContextValue | undefined>(undefined);
 
-/**
- * Central auth state for the whole app.
- *
- * Notes for reviewers:
- *  - onAuthStateChange is registered FIRST so no event is missed.
- *  - Profile loading is deferred out of the callback to avoid deadlocks.
- */
+async function readProfile(user: User): Promise<Profile> {
+  const ref = doc(db, "profiles", user.uid);
+  const snapshot = await getDoc(ref);
+  const defaults: Profile = {
+    id: user.uid,
+    email: user.email,
+    full_name: user.displayName,
+    avatar_url: user.photoURL,
+    target_role: "",
+    experience_level: "",
+    bio: null,
+  };
+  if (!snapshot.exists()) await setDoc(ref, { ...defaults, created_at: new Date().toISOString() });
+  return { ...defaults, ...(snapshot.data() as Partial<Profile>) };
+}
+
 export function AuthProvider({ children }: { children: ReactNode }) {
-  const [session, setSession] = useState<Session | null>(null);
   const [user, setUser] = useState<User | null>(null);
+  const [session, setSession] = useState<{ access_token: string } | null>(null);
   const [profile, setProfile] = useState<Profile | null>(null);
   const [loading, setLoading] = useState(true);
-  // Guards against re-fetching the same profile on every auth event (token refresh,
-  // tab focus, INITIAL_SESSION + getSession racing) — that was the duplicate-request storm.
-  const loadedForRef = useRef<string | null>(null);
 
-  const loadProfile = useCallback(async (userId: string, force = false) => {
-    if (!force && loadedForRef.current === userId) return;
-    loadedForRef.current = userId;
-
-    const { data, error } = await supabase
-      .from("profiles")
-      .select("id, email, full_name, avatar_url, target_role, experience_level, bio")
-      .eq("id", userId)
-      .maybeSingle();
-
-    if (error) {
-      loadedForRef.current = null;
-      console.error("[auth] failed to load profile", error.message);
+  useEffect(() => onAuthStateChanged(auth, async (nextUser) => {
+    setUser(nextUser);
+    if (!nextUser) {
+      setSession(null);
+      setProfile(null);
+      setLoading(false);
       return;
     }
-    setProfile((data as Profile) ?? null);
-  }, []);
-
-  useEffect(() => {
-    const { data: subscription } = supabase.auth.onAuthStateChange((_event, nextSession) => {
-      setSession(nextSession);
-      setUser(nextSession?.user ?? null);
+    try {
+      const [token, nextProfile] = await Promise.all([nextUser.getIdToken(), readProfile(nextUser)]);
+      setSession({ access_token: token });
+      setProfile(nextProfile);
+    } catch (error) {
+      console.error("[auth] failed to load profile", error);
+      setProfile(null);
+    } finally {
       setLoading(false);
-      if (nextSession?.user) {
-        const uid = nextSession.user.id;
-        // defer: never call another supabase fn synchronously inside this callback
-        setTimeout(() => void loadProfile(uid), 0);
-      } else {
-        loadedForRef.current = null;
-        setProfile(null);
-      }
-    });
-
-    supabase.auth.getSession().then(({ data }) => {
-      setSession(data.session);
-      setUser(data.session?.user ?? null);
-      setLoading(false);
-      if (data.session?.user) void loadProfile(data.session.user.id);
-    });
-
-    return () => subscription.subscription.unsubscribe();
-  }, [loadProfile]);
+    }
+  }), []);
 
   const signIn = useCallback(async (email: string, password: string) => {
-    const { error } = await supabase.auth.signInWithPassword({ email, password });
-    if (error) throw new Error(error.message);
+    await signInWithEmailAndPassword(auth, email, password);
   }, []);
 
   const signUp = useCallback(async (fullName: string, email: string, password: string) => {
-    const { data, error } = await supabase.auth.signUp({
+    const credential = await createUserWithEmailAndPassword(auth, email, password);
+    await firebaseUpdateAuthProfile(credential.user, { displayName: fullName });
+    await setDoc(doc(db, "profiles", credential.user.uid), {
+      id: credential.user.uid,
       email,
-      password,
-      options: {
-        emailRedirectTo: `${window.location.origin}/dashboard`,
-        data: { full_name: fullName },
-      },
+      full_name: fullName,
+      avatar_url: null,
+      target_role: "",
+      experience_level: "",
+      bio: null,
+      created_at: new Date().toISOString(),
     });
-    if (error) throw new Error(error.message);
-    // With email confirmation enabled the session is null until the link is clicked.
-    return { needsEmail: !data.session };
+    return { needsEmail: false };
   }, []);
 
   const signInWithGoogle = useCallback(async () => {
-    const redirectTo = `${window.location.origin}/auth/callback`;
-
-    // The managed OAuth broker (/~oauth/initiate) only exists on Lovable hosting.
-    // Anywhere else (Vercel, custom self-hosting) go straight through the backend
-    // auth provider with your own Google OAuth credentials.
-    const host = window.location.hostname;
-    const isLovableHost =
-      host.endsWith(".lovable.app") ||
-      host.endsWith(".lovableproject.com") ||
-      host === "localhost" ||
-      host === "127.0.0.1";
-
-    if (import.meta.env.VITE_USE_SUPABASE_OAUTH === "true" || !isLovableHost) {
-      const { error } = await supabase.auth.signInWithOAuth({
-        provider: "google",
-        options: { redirectTo },
-      });
-      if (error) throw new Error(error.message);
-      return { redirected: true };
-    }
-
-    const result = await lovable.auth.signInWithOAuth("google", {
-      redirect_uri: redirectTo,
-    });
-    if (result.error) throw new Error(result.error.message ?? "Google sign-in failed");
-    return { redirected: result.redirected === true };
+    await signInWithPopup(auth, new GoogleAuthProvider());
+    return { redirected: false };
   }, []);
 
   const sendPasswordReset = useCallback(async (email: string) => {
-    const { error } = await supabase.auth.resetPasswordForEmail(email, {
-      redirectTo: `${window.location.origin}/reset-password`,
-    });
-    if (error) throw new Error(error.message);
+    await sendPasswordResetEmail(auth, email, { url: `${window.location.origin}/login` });
   }, []);
 
-  const updatePassword = useCallback(async (password: string) => {
-    const { error } = await supabase.auth.updateUser({ password });
-    if (error) throw new Error(error.message);
+  const changePassword = useCallback(async (password: string) => {
+    const code = new URLSearchParams(window.location.search).get("oobCode");
+    if (code) {
+      await confirmPasswordReset(auth, code, password);
+      return;
+    }
+    if (!auth.currentUser) throw new Error("Not signed in");
+    await firebaseUpdatePassword(auth.currentUser, password);
   }, []);
 
-  const updateProfile = useCallback(
-    async (patch: Partial<Profile>) => {
-      if (!user) throw new Error("Not signed in");
-      const { error } = await supabase.from("profiles").update(patch).eq("id", user.id);
-      if (error) throw new Error(error.message);
-      setProfile((current) => (current ? { ...current, ...patch } : current));
-    },
-    [user],
-  );
+  const updateProfile = useCallback(async (patch: Partial<Profile>) => {
+    if (!user) throw new Error("Not signed in");
+    const { full_name, avatar_url, ...fields } = patch;
+    await updateDoc(doc(db, "profiles", user.uid), { ...fields, updated_at: new Date().toISOString() });
+    if (full_name !== undefined || avatar_url !== undefined) {
+      await firebaseUpdateAuthProfile(user, {
+        ...(full_name !== undefined ? { displayName: full_name ?? undefined } : {}),
+        ...(avatar_url !== undefined ? { photoURL: avatar_url ?? undefined } : {}),
+      });
+    }
+    setProfile((current) => (current ? { ...current, ...patch } : current));
+  }, [user]);
 
-  const signOut = useCallback(async () => {
-    await supabase.auth.signOut();
-    setProfile(null);
-    setUser(null);
-    setSession(null);
-  }, []);
-
-  const value = useMemo(
-    () => ({
-      user,
-      session,
-      profile,
-      loading,
-      signIn,
-      signUp,
-      signInWithGoogle,
-      sendPasswordReset,
-      updatePassword,
-      updateProfile,
-      signOut,
-    }),
-    [
-      user,
-      session,
-      profile,
-      loading,
-      signIn,
-      signUp,
-      signInWithGoogle,
-      sendPasswordReset,
-      updatePassword,
-      updateProfile,
-      signOut,
-    ],
-  );
+  const signOut = useCallback(async () => firebaseSignOut(auth), []);
+  const value = useMemo(() => ({ user, session, profile, loading, signIn, signUp, signInWithGoogle, sendPasswordReset, updatePassword: changePassword, updateProfile, signOut }), [user, session, profile, loading, signIn, signUp, signInWithGoogle, sendPasswordReset, changePassword, updateProfile, signOut]);
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
 }
